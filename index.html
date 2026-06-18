@@ -34,6 +34,7 @@
           const [githubToken, setGithubToken] = useState('');
           const [gistId, setGistId] = useState('');
           const [isConfigured, setIsConfigured] = useState(false);
+          const [remoteLoaded, setRemoteLoaded] = useState(false);
           const [syncStatus, setSyncStatus] = useState('');
           const [isLoading, setIsLoading] = useState(true);
 
@@ -58,16 +59,23 @@
             }
           }, []);
 
-          // Save to Gist whenever data changes (debounced)
+          // Keep a local recovery copy after a trusted data source has loaded.
           useEffect(() => {
-            if (!isConfigured || isLoading) return;
+            if (isLoading || (isConfigured && !remoteLoaded)) return;
+            localStorage.setItem('goalsTrackerGoals', JSON.stringify(goals));
+            localStorage.setItem('goalsTrackerCompletions', JSON.stringify(completions));
+          }, [goals, completions, isConfigured, isLoading, remoteLoaded]);
+
+          // Save to Gist only after its current contents loaded successfully.
+          useEffect(() => {
+            if (!isConfigured || isLoading || !remoteLoaded) return;
             
             const timeoutId = setTimeout(() => {
               saveToGist();
             }, 1000); // Wait 1 second after last change before saving
             
             return () => clearTimeout(timeoutId);
-          }, [goals, completions, isConfigured, isLoading]);
+          }, [goals, completions, isConfigured, isLoading, remoteLoaded]);
 
           const loadFromGist = async (token, gistIdToLoad) => {
             try {
@@ -86,15 +94,24 @@
               
               setGoals(content.goals);
               setCompletions(content.completions);
+              localStorage.setItem('goalsTrackerGoals', JSON.stringify(content.goals));
+              localStorage.setItem('goalsTrackerCompletions', JSON.stringify(content.completions));
+              setRemoteLoaded(true);
               setSyncStatus('✓ Synced');
               setIsLoading(false);
               
               setTimeout(() => setSyncStatus(''), 2000);
             } catch (error) {
               console.error('Error loading from Gist:', error);
-              setSyncStatus('✗ Load failed');
+              const savedGoals = localStorage.getItem('goalsTrackerGoals');
+              const savedCompletions = localStorage.getItem('goalsTrackerCompletions');
+              if (savedGoals) setGoals(JSON.parse(savedGoals));
+              if (savedCompletions) setCompletions(JSON.parse(savedCompletions));
+              setRemoteLoaded(false);
+              setSyncStatus(savedGoals || savedCompletions
+                ? '⚠ Gist load failed — showing local backup'
+                : '✗ Gist load failed — autosave paused');
               setIsLoading(false);
-              setTimeout(() => setSyncStatus(''), 3000);
             }
           };
 
@@ -174,6 +191,7 @@
               setGithubToken(token);
               setGistId(gist.id);
               setIsConfigured(true);
+              setRemoteLoaded(true);
               setSyncStatus('✓ Connected!');
               
               setTimeout(() => setSyncStatus(''), 2000);
@@ -193,6 +211,7 @@
             setGithubToken('');
             setGistId('');
             setIsConfigured(false);
+            setRemoteLoaded(false);
             setSyncStatus('');
             
             // Save current state to localStorage
@@ -513,6 +532,7 @@
                                   setGithubToken(token);
                                   setGistId(gistIdInput);
                                   setIsConfigured(true);
+                                  setRemoteLoaded(false);
                                   
                                   loadFromGist(token, gistIdInput);
                                 }}
