@@ -19,6 +19,110 @@
     <script type="text/babel">
         const { useState, useEffect } = React;
 
+        const SYNC_DB_NAME = 'goalsTrackerSync';
+        const SYNC_STORE_NAME = 'settings';
+
+        const openSyncDatabase = () => new Promise((resolve, reject) => {
+          if (!window.indexedDB) {
+            reject(new Error('IndexedDB is unavailable'));
+            return;
+          }
+
+          const request = indexedDB.open(SYNC_DB_NAME, 1);
+          request.onupgradeneeded = () => {
+            const database = request.result;
+            if (!database.objectStoreNames.contains(SYNC_STORE_NAME)) {
+              database.createObjectStore(SYNC_STORE_NAME);
+            }
+          };
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error);
+        });
+
+        const readSyncConfiguration = async () => {
+          const localToken = localStorage.getItem('githubToken');
+          const localGistId = localStorage.getItem('gistId');
+          if (localToken && localGistId) {
+            return { token: localToken, gistId: localGistId };
+          }
+
+          try {
+            const database = await openSyncDatabase();
+            const configuration = await new Promise((resolve, reject) => {
+              const transaction = database.transaction(SYNC_STORE_NAME, 'readonly');
+              const request = transaction.objectStore(SYNC_STORE_NAME).get('github');
+              request.onsuccess = () => resolve(request.result || null);
+              request.onerror = () => reject(request.error);
+            });
+            database.close();
+
+            if (configuration?.token && configuration?.gistId) {
+              localStorage.setItem('githubToken', configuration.token);
+              localStorage.setItem('gistId', configuration.gistId);
+              return configuration;
+            }
+          } catch (error) {
+            console.warn('Could not read backup sync configuration:', error);
+          }
+
+          return null;
+        };
+
+        const saveSyncConfiguration = async (configuration) => {
+          localStorage.setItem('githubToken', configuration.token);
+          localStorage.setItem('gistId', configuration.gistId);
+
+          try {
+            const database = await openSyncDatabase();
+            await new Promise((resolve, reject) => {
+              const transaction = database.transaction(SYNC_STORE_NAME, 'readwrite');
+              const request = transaction.objectStore(SYNC_STORE_NAME).put(configuration, 'github');
+              request.onsuccess = () => resolve();
+              request.onerror = () => reject(request.error);
+            });
+            database.close();
+          } catch (error) {
+            console.warn('Could not save backup sync configuration:', error);
+          }
+        };
+
+        const clearSyncConfiguration = async () => {
+          localStorage.removeItem('githubToken');
+          localStorage.removeItem('gistId');
+
+          try {
+            const database = await openSyncDatabase();
+            await new Promise((resolve, reject) => {
+              const transaction = database.transaction(SYNC_STORE_NAME, 'readwrite');
+              const request = transaction.objectStore(SYNC_STORE_NAME).delete('github');
+              request.onsuccess = () => resolve();
+              request.onerror = () => reject(request.error);
+            });
+            database.close();
+          } catch (error) {
+            console.warn('Could not clear backup sync configuration:', error);
+          }
+        };
+
+        const getGitHubError = async (response, action) => {
+          let detail = '';
+          try {
+            const body = await response.json();
+            detail = body.message || '';
+          } catch (_) {}
+
+          if (response.status === 401) {
+            return `${action} failed: the GitHub token is invalid or expired. Reconnect with a new classic token that has gist permission.`;
+          }
+          if (response.status === 403) {
+            return `${action} failed: GitHub denied access. Check that the token has gist permission and is authorized for your account.`;
+          }
+          if (response.status === 404) {
+            return `${action} failed: the Gist was not found or this token cannot access it. Check the Gist ID and token.`;
+          }
+          return `${action} failed (${response.status})${detail ? `: ${detail}` : ''}`;
+        };
+
         const GoalsTracker = () => {
           const [goals, setGoals] = useState([
             { id: 1, name: 'Music', color: '#10b981' },
@@ -38,25 +142,29 @@
           const [syncStatus, setSyncStatus] = useState('');
           const [isLoading, setIsLoading] = useState(true);
 
-          // Check for saved configuration
+          // Check both browser stores for a saved configuration.
           useEffect(() => {
-            const savedToken = localStorage.getItem('githubToken');
-            const savedGistId = localStorage.getItem('gistId');
-            
-            if (savedToken && savedGistId) {
-              setGithubToken(savedToken);
-              setGistId(savedGistId);
-              setIsConfigured(true);
-              loadFromGist(savedToken, savedGistId);
-            } else {
-              // Fall back to localStorage if not configured
+            const restore = async () => {
+              const configuration = await readSyncConfiguration();
+
+              if (configuration) {
+                setGithubToken(configuration.token);
+                setGistId(configuration.gistId);
+                setIsConfigured(true);
+                await loadFromGist(configuration.token, configuration.gistId);
+                return;
+              }
+
+              // Fall back to the local recovery copy if not configured.
               const savedGoals = localStorage.getItem('goalsTrackerGoals');
               const savedCompletions = localStorage.getItem('goalsTrackerCompletions');
-              
+
               if (savedGoals) setGoals(JSON.parse(savedGoals));
               if (savedCompletions) setCompletions(JSON.parse(savedCompletions));
               setIsLoading(false);
-            }
+            };
+
+            restore();
           }, []);
 
           // Keep a local recovery copy after a trusted data source has loaded.
@@ -87,10 +195,17 @@
                 }
               });
               
-              if (!response.ok) throw new Error('Failed to load from Gist');
+              if (!response.ok) throw new Error(await getGitHubError(response, 'Gist load'));
               
               const gist = await response.json();
-              const content = JSON.parse(gist.files['goals-data.json'].content);
+              const dataFile = gist.files?.['goals-data.json'];
+              if (!dataFile?.content) {
+                throw new Error('Gist load failed: goals-data.json is missing or empty.');
+              }
+              const content = JSON.parse(dataFile.content);
+              if (!Array.isArray(content.goals) || !content.completions || typeof content.completions !== 'object') {
+                throw new Error('Gist load failed: goals-data.json has an invalid format.');
+              }
               
               setGoals(content.goals);
               setCompletions(content.completions);
@@ -108,9 +223,7 @@
               if (savedGoals) setGoals(JSON.parse(savedGoals));
               if (savedCompletions) setCompletions(JSON.parse(savedCompletions));
               setRemoteLoaded(false);
-              setSyncStatus(savedGoals || savedCompletions
-                ? '⚠ Gist load failed — showing local backup'
-                : '✗ Gist load failed — autosave paused');
+              setSyncStatus(error.message);
               setIsLoading(false);
             }
           };
@@ -140,14 +253,13 @@
                 })
               });
               
-              if (!response.ok) throw new Error('Failed to save to Gist');
+              if (!response.ok) throw new Error(await getGitHubError(response, 'Gist save'));
               
               setSyncStatus('✓ Synced');
               setTimeout(() => setSyncStatus(''), 2000);
             } catch (error) {
               console.error('Error saving to Gist:', error);
-              setSyncStatus('✗ Save failed');
-              setTimeout(() => setSyncStatus(''), 3000);
+              setSyncStatus(error.message);
             }
           };
 
@@ -180,13 +292,12 @@
                 })
               });
               
-              if (!response.ok) throw new Error('Failed to create Gist');
+              if (!response.ok) throw new Error(await getGitHubError(response, 'Gist creation'));
               
               const gist = await response.json();
               
-              // Save configuration
-              localStorage.setItem('githubToken', token);
-              localStorage.setItem('gistId', gist.id);
+              // Save the connection in two browser stores for recovery.
+              await saveSyncConfiguration({ token, gistId: gist.id });
               
               setGithubToken(token);
               setGistId(gist.id);
@@ -202,11 +313,10 @@
             }
           };
 
-          const disconnectGitHub = () => {
+          const disconnectGitHub = async () => {
             if (!window.confirm('Disconnect GitHub sync? Your data will remain in the Gist, but won\'t sync anymore.')) return;
             
-            localStorage.removeItem('githubToken');
-            localStorage.removeItem('gistId');
+            await clearSyncConfiguration();
             
             setGithubToken('');
             setGistId('');
@@ -526,15 +636,13 @@
                                     return;
                                   }
                                   
-                                  localStorage.setItem('githubToken', token);
-                                  localStorage.setItem('gistId', gistIdInput);
-                                  
-                                  setGithubToken(token);
-                                  setGistId(gistIdInput);
-                                  setIsConfigured(true);
-                                  setRemoteLoaded(false);
-                                  
-                                  loadFromGist(token, gistIdInput);
+                                  saveSyncConfiguration({ token, gistId: gistIdInput }).then(() => {
+                                    setGithubToken(token);
+                                    setGistId(gistIdInput);
+                                    setIsConfigured(true);
+                                    setRemoteLoaded(false);
+                                    loadFromGist(token, gistIdInput);
+                                  });
                                 }}
                                 className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
                               >
@@ -558,7 +666,32 @@
                         </div>
                       ) : (
                         <div>
-                          <p className="text-green-600 mb-4">✓ Connected to GitHub</p>
+                          <p className={remoteLoaded ? "text-green-600 mb-4" : "text-amber-700 mb-4"}>
+                            {remoteLoaded ? '✓ Connected to GitHub' : '⚠ Connection saved, but sync is paused'}
+                          </p>
+                          {!remoteLoaded && (
+                            <div className="mb-4 flex gap-2">
+                              <button
+                                onClick={() => loadFromGist(githubToken, gistId)}
+                                className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
+                              >
+                                Retry Connection
+                              </button>
+                              <button
+                                onClick={async () => {
+                                  const replacementToken = window.prompt('Enter a new GitHub Personal Access Token:');
+                                  if (!replacementToken) return;
+                                  await saveSyncConfiguration({ token: replacementToken, gistId });
+                                  setGithubToken(replacementToken);
+                                  setRemoteLoaded(false);
+                                  loadFromGist(replacementToken, gistId);
+                                }}
+                                className="px-4 py-2 bg-gray-700 text-white rounded hover:bg-gray-600 transition-colors"
+                              >
+                                Update Token
+                              </button>
+                            </div>
+                          )}
                           <div className="mb-4 p-3 bg-gray-50 rounded">
                             <p className="text-sm text-gray-600 mb-1">Your Gist ID (copy this for other devices):</p>
                             <div className="flex gap-2">
